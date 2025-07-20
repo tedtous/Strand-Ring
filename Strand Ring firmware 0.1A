@@ -1,0 +1,118 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_LIS3DH.h>
+#include <Adafruit_Sensor.h>
+#include <NimBLEDevice.h>
+
+// === CONFIGURATION ===
+#define LED_PIN 2
+#define ACC_THRESHOLD 1.2    // Accélération seuil g (ajuster au besoin)
+#define GESTE_DEBOUNCE_MS 500
+#define INACTIVITY_SLEEP_MS 10000
+
+// === OBJETS CAPTEUR ===
+Adafruit_LIS3DH lis = Adafruit_LIS3DH();
+bool calibrated = false;
+float refX = 0, refY = 0, refZ = 0;
+unsigned long lastLikeTime = 0;
+
+// === BLE ===
+NimBLECharacteristic* pCharacteristic;
+
+#define SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define CHAR_UUID    "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  Serial.begin(115200);
+
+  Wire.begin();
+  if (!lis.begin(0x18)) {
+    Serial.println("LIS3DH non détecté !");
+    while (1);
+  }
+  lis.setRange(LIS3DH_RANGE_2_G);
+
+  // Initialisation BLE
+  NimBLEDevice::init("StrandRing");
+  NimBLEServer* pServer = NimBLEDevice::createServer();
+  NimBLEService* pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+    CHAR_UUID,
+    NIMBLE_PROPERTY::NOTIFY
+  );
+  pService->start();
+  NimBLEDevice::getAdvertising()->start();
+
+  Serial.println("Démarrage terminé. En attente calibration...");
+}
+
+bool detectLike(float &accX, float &accY, float &accZ) {
+  sensors_event_t event;
+  lis.getEvent(&event);
+  accX = event.acceleration.x;
+  accY = event.acceleration.y;
+  accZ = event.acceleration.z;
+
+  // Détection du pouce levé : forte accélération vers le haut (axe Y)
+  // et faible déviation sur X/Z
+  if (accY > ACC_THRESHOLD && abs(accX) < 0.8 && abs(accZ) < 1.5) {
+    return true;
+  }
+  return false;
+}
+
+void sendBLELike(float x, float y, float z) {
+  String msg = "LIKE|X:" + String(x, 2) + ",Y:" + String(y, 2) + ",Z:" + String(z, 2);
+  pCharacteristic->setValue(msg.c_str());
+  pCharacteristic->notify();
+  Serial.println("Envoyé BLE: " + msg);
+}
+
+void enterDeepSleep() {
+  Serial.println("Mise en veille profonde...");
+  digitalWrite(LED_PIN, LOW);
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_8, 1); // LIS3DH INT sur GPIO8 par exemple
+  esp_deep_sleep_start();
+}
+
+void loop() {
+  float x, y, z;
+  bool likeDetected = detectLike(x, y, z);
+
+  if (!calibrated) {
+    // LED clignote 2x/s en attente calibration
+    digitalWrite(LED_PIN, (millis() % 500) < 250 ? HIGH : LOW);
+
+    if (likeDetected) {
+      calibrated = true;
+      refX = x; refY = y; refZ = z;
+
+      Serial.printf("Calibration réalisée: X=%.2f Y=%.2f Z=%.2f\n", refX, refY, refZ);
+
+      // LED allumée 3 secondes pour signaler calibration OK
+      digitalWrite(LED_PIN, HIGH);
+      delay(3000);
+      digitalWrite(LED_PIN, LOW);
+    }
+  } else {
+    digitalWrite(LED_PIN, LOW);
+    // Détection LIKE réel selon calibration (seuil distance vectorielle)
+    float dist = sqrt(sq(x - refX) + sq(y - refY) + sq(z - refZ));
+    if (likeDetected && dist < 4.0 && (millis() - lastLikeTime) > GESTE_DEBOUNCE_MS) {
+      lastLikeTime = millis();
+      sendBLELike(x, y, z);
+      // Flash LED court
+      digitalWrite(LED_PIN, HIGH);
+      delay(100);
+      digitalWrite(LED_PIN, LOW);
+    }
+
+    // Mise en veille profonde si inactivité
+    if ((millis() - lastLikeTime) > INACTIVITY_SLEEP_MS) {
+      enterDeepSleep();
+    }
+  }
+
+  delay(20);
+}
